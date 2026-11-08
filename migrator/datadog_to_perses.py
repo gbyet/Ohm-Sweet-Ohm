@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Forward parser V8: Datadog dashboard JSON  ->  Dash0 (Perses) dashboard JSON.
+Forward parser V12: Datadog dashboard JSON  ->  Dash0 (Perses) dashboard JSON.
 
 Deterministic and rule-based: no LLM, no randomness. Same input, same output.
 The only network calls are the optional --verify and --push flags.
@@ -49,6 +49,7 @@ WIDGET_TYPES = {
     "free_text": "Markdown",
     "list_stream": "TimeSeriesChart",  # V6: log list -> log count chart (alternative)
     "image": "Markdown",  # V7: image -> Markdown ![](url)
+    "heatmap": "TimeSeriesChart",  # V10: one line per series instead of colour bands
 }
 SCALAR_WIDGETS = {"query_value", "query_table", "toplist", "sunburst"}
 
@@ -84,6 +85,28 @@ OPERATIONS = {
     "web.request": 'otel_span_kind="SERVER"',
     "glitchy_shop": None,  # internal spans of the shop (app-specific, reported as assumption)
 }
+
+# Datadog's OpenTelemetry operation names, read backwards (V12). Datadog names an OTel span by the
+# first matching rule (docs.datadoghq.com/opentelemetry/migrate/migrate_operation_names):
+#   http.request.method set        -> http.server.request / http.client.request
+#   rpc.system set (and no method) -> <rpc.system>.server.request / <rpc.system>.client.request
+# Only these two rules are used: they are the ones whose attributes Dash0's span metric carries.
+OTEL_OPERATION = re.compile(r"([a-z][a-z0-9_]*)\.(server|client)\.request")
+SPAN_KINDS = {"server": 'otel_span_kind="SERVER"', "client": 'otel_span_kind="CLIENT"'}
+
+
+def otel_operation(operation, notes):
+    """Datadog operation name of an OpenTelemetry span -> Dash0 span matchers, or None."""
+    m = OTEL_OPERATION.fullmatch(operation)
+    if not m:
+        return None
+    system, side = m.groups()
+    if system == "http":
+        notes.append(f"Datadog operation '{operation}': {side} spans with an HTTP method (Datadog's OTel naming rule)")
+        return [SPAN_KINDS[side], 'http_request_method!=""']
+    notes.append(f"Datadog operation '{operation}': {side} spans with rpc.system '{system}' (Datadog's OTel naming rule)")
+    return [SPAN_KINDS[side], f'rpc_system="{system}"', 'http_request_method=""']
+
 
 PERCENTILES = {"p50": "0.5", "p75": "0.75", "p90": "0.9", "p95": "0.95", "p99": "0.99"}
 AGGREGATORS = {"sum", "avg", "min", "max", "count"}
@@ -200,6 +223,9 @@ class Unsupported(Exception):
 QUERY = re.compile(
     r"^\s*(\w+):([\w.]+)\{([^{}]*)\}\s*(?:by\s*\{([^{}]*)\})?\s*((?:\.\w+\([^()]*\))*)\s*$", re.S
 )
+# "metric{...}" without "agg:" in front (Datadog's default space aggregator is avg)
+BARE_METRIC = re.compile(r"(?<![\w:.$])([a-zA-Z_][\w.]*)\{")
+BARE_QUERY = re.compile(r"^\s*[a-zA-Z_][\w.]*\{")
 MODIFIER = re.compile(r"\.(\w+)\(([^()]*)\)")
 
 
@@ -216,6 +242,8 @@ def parse_modifiers(text, notes):
             if len(args) != 2 or args[0] not in ("avg", "sum", "min", "max", "count") or not args[1].isdigit():
                 raise Unsupported(f".rollup({', '.join(args)}) has no rule")
             rollup = (args[0], int(args[1]))
+        elif name == "weighted":
+            notes.append(".weighted() dropped (Datadog's time-weighting for gauges whose tags change)")
         elif name == "fill":
             if args[:1] != ["null"]:
                 notes.append(f".fill({', '.join(args)}) dropped (gaps stay empty in Dash0)")
@@ -252,12 +280,12 @@ def map_filters(text, notes, variables):
         if term == "*":
             continue
 
-        var = re.fullmatch(r"\$(\w+)", term)
+        var = re.fullmatch(r"(!?)\$([\w.\-]+)", term)
         if var:
-            name = var.group(1)
+            neg, name = var.groups()
             if name not in variables:
                 raise Unsupported(f"template variable ${name} is not defined")
-            matchers.append(f'{variables[name]}=~"${name}"')
+            matchers.append(f'{variables[name]}{"!~" if neg else "=~"}"{var_ref(name)}"')
             continue
 
         group = re.fullmatch(r"(NOT\s+|!)?\((.+)\)", term)
@@ -308,8 +336,9 @@ def map_metric(metric, prefix, notes):
     transform is "" or "*<factor>" (Datadog's OTel mapping, e.g. system.cpu.user = utilization × 100).
     """
     if not metric.startswith("trace."):
-        if prefix in PERCENTILES:
-            raise Unsupported(f"percentile '{prefix}' of a non-trace metric has no rule")
+        if prefix in PERCENTILES:  # pNN only exists on Datadog distributions -> OTel histogram in Dash0
+            notes.append(f"{prefix} of '{metric}': assumes the Datadog distribution reaches Dash0 as a histogram (unverified)")
+            return metric, [], "percentile", None, ""
         entry = CATALOG.get(metric)
         if OPTIONS["metrics"] == "otel" and entry and entry["otel"]:
             # Datadog's published mapping, read backwards: OTel name + attribute filter + scale
@@ -333,13 +362,15 @@ def map_metric(metric, prefix, notes):
             raise Unsupported(f"metric '{metric}' not in table")
         operation, kind = m.group(1), m.group(2)
 
-    if operation not in OPERATIONS:
-        raise Unsupported(f"metric '{metric}' not in table")
-    span_kind = OPERATIONS[operation]
-    if span_kind is None:
-        notes.append(f"Datadog operation '{operation}' assumed to be the shop's internal spans")
-
-    extra = [span_kind] if span_kind else []
+    if operation in OPERATIONS:
+        span_kind = OPERATIONS[operation]
+        if span_kind is None:
+            notes.append(f"Datadog operation '{operation}' assumed to be the shop's internal spans")
+        extra = [span_kind] if span_kind else []
+    else:
+        extra = otel_operation(operation, notes)
+        if extra is None:
+            raise Unsupported(f"metric '{metric}' not in table")
     if kind == "duration":
         return "dash0.spans.duration", extra, "percentile", None, ""
     if kind == "errors":
@@ -358,6 +389,9 @@ def translate_query(dd_query, aggregator, widget_type, variables, notes, shift=N
       unknown        gauge, unless a modifier says it is a counter
     Counters are assumed to reach Dash0 as cumulative sums (OpenTelemetry Collector, Datadog receiver).
     """
+    if BARE_QUERY.match(dd_query):
+        dd_query = "avg:" + dd_query.lstrip()
+        notes.append("no space aggregator in the query: Datadog's default avg")
     m = QUERY.match(dd_query)
     if not m:
         raise Unsupported(f"query shape not supported: {dd_query}")
@@ -583,6 +617,13 @@ class FormulaParser:
             if word in ("clamp_max", "min"):
                 return f"clamp_max({inner}, {n})"
             return f"(({inner}) {'>=' if word == 'cutoff_min' else '<='} {n})"  # cutoff: values past N dropped
+        if word == "throughput":  # Datadog: each value divided by the bucket length in seconds
+            inner = self.expr()
+            self.eat(")")
+            notes.append("throughput(): divided by the step in seconds (Datadog divided by its bucket length)")
+            return f"(({inner}) / (${{__interval_ms}} / 1000))"
+        if word == "rate":  # Datadog's rate() is the per-second rate of change, same as per_second()
+            word = "per_second"
         if word in ("diff", "derivative", "monotonic_diff", "per_second", "per_minute", "per_hour"):
             inner = self.expr()
             self.eat(")")
@@ -711,7 +752,8 @@ def upgrade_request(req):
     if "q" not in req or "queries" in req:
         return req
     out = {k: v for k, v in req.items() if k not in ("q", "metadata", "alias", "limit", "order")}
-    aliases = {m.get("expression"): m.get("alias_name") for m in req.get("metadata") or []}
+    aliases = {BARE_METRIC.sub(r"avg:\1{", m.get("expression") or ""): m.get("alias_name")
+               for m in req.get("metadata") or []}
     queries, formulas = [], []
 
     def sub(match):
@@ -719,7 +761,8 @@ def upgrade_request(req):
                         "query": match.group(0), "aggregator": req.get("aggregator", "avg")})
         return queries[-1]["name"]
 
-    series = split_top_level(req["q"])
+    q = BARE_METRIC.sub(r"avg:\1{", req["q"])  # no space aggregator: Datadog's default avg
+    series = split_top_level(q)
     for text in series:
         formula = {"formula": METRIC_QUERY.sub(sub, text)}
         alias = aliases.get(text) or (req.get("alias") if len(series) == 1 else None)
@@ -742,6 +785,14 @@ def upgrade_widget(w):
 
 
 def convert_widget(defn, variables, report):
+    hostmap = defn.get("type") == "hostmap"
+    if hostmap:  # host map -> table of the colour ("fill") query, one row per host
+        fill = (defn.get("requests") or {}).get("fill") or {}
+        if "q" not in fill:
+            report.add("FAIL", defn.get("title") or "Host map", ["hostmap without a fill query"])
+            return placeholder(defn.get("title") or "Host map", "Datadog host map without a fill query was not migrated.")
+        defn = dict(defn, type="query_table", title=defn.get("title") or "Host map",
+                    requests=[upgrade_request({"q": fill["q"], "aggregator": "avg"})])
     wtype = defn.get("type")
     title = defn.get("title") or {"note": "Note", "free_text": "Text", "image": "Image"}.get(wtype, wtype)
     kind = WIDGET_TYPES.get(wtype)
@@ -774,6 +825,9 @@ def convert_widget(defn, variables, report):
 
     try:
         for req in defn.get("requests", []):
+            if "queries" in req and "formulas" not in req:
+                # formulas are optional in Datadog: without them every query is shown as it is
+                req = dict(req, formulas=[{"formula": q["name"]} for q in req["queries"] if "name" in q])
             if "queries" not in req or "formulas" not in req:
                 raise Unsupported("request without queries/formulas (old Datadog format) has no rule")
             translator = QueryTranslator(req["queries"], wtype, variables, notes)
@@ -822,6 +876,10 @@ def convert_widget(defn, variables, report):
         spec["visual"] = {"display": "bar" if display == {"bars"} else "line"}
     if wtype == "toplist":
         notes.append("toplist shown as a table (Dash0 has no ranked bar list)")
+    if hostmap:
+        notes.append("host map shown as a table, one row per host (Dash0 has no host map); size query dropped")
+    if wtype == "heatmap":
+        notes.append("heatmap shown as a line chart, one line per series (Dash0 has no heatmap panel)")
 
     report.add("WARN" if notes else "OK", title, notes, metrics)
     return panel(title, kind, spec, queries)
@@ -963,6 +1021,9 @@ def convert_log_stream(defn, notes, variables=None):
     Dash0 dashboards have no log list panel; the matching log lines are in Dash0's Logs explorer.
     """
     reqs = defn.get("requests", [])
+    source = (reqs[0].get("query", {}).get("data_source") if len(reqs) == 1 else None)
+    if source and source != "logs_stream":
+        raise Unsupported(f"list of '{source}' items has no Dash0 equivalent (only log lists are migrated)")
     if len(reqs) != 1 or reqs[0].get("query", {}).get("data_source") != "logs_stream":
         raise Unsupported("only a single logs_stream request is supported")
     search = reqs[0]["query"].get("query_string", "").strip()

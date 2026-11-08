@@ -1,0 +1,2 @@
+The same dashboard twice: requests and requests per second of the shop.
+datadog.json is the Datadog version, dash0.json the Dash0 version.

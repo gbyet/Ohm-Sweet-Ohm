@@ -1,0 +1,105 @@
+{
+  "apiVersion": "perses.dev/v1alpha1",
+  "kind": "PersesDashboard",
+  "metadata": {
+    "labels": {
+      "dash0.com/dataset": "faulty-ecommerce",
+      "dash0.com/id": "ae8ed0a0-e257-4f24-a57c-af918e400a6c"
+    },
+    "name": "glitchy-shop-minimal"
+  },
+  "spec": {
+    "display": {
+      "description": "Smallest useful Perses example - one stat panel and one time series",
+      "name": "Glitchy Shop - Minimal"
+    },
+    "duration": "1h",
+    "layouts": [
+      {
+        "kind": "Grid",
+        "spec": {
+          "items": [
+            {
+              "content": {
+                "$ref": "#/spec/panels/requestsStat"
+              },
+              "height": 6,
+              "width": 8,
+              "x": 0,
+              "y": 0
+            },
+            {
+              "content": {
+                "$ref": "#/spec/panels/requestRate"
+              },
+              "height": 6,
+              "width": 16,
+              "x": 8,
+              "y": 0
+            }
+          ]
+        }
+      }
+    ],
+    "panels": {
+      "requestRate": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Requests per second"
+          },
+          "plugin": {
+            "kind": "TimeSeriesChart",
+            "spec": {}
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "hidden": false,
+                    "id": "ff319acc-6553-49eb-8e99-749b22ff5e3c",
+                    "query": "sum(rate({otel_metric_name=\"dash0.spans\", service_name=\"glitchy-shop\", otel_span_kind=\"SERVER\"}[$__rate_interval]))",
+                    "seriesNameFormat": "Requests"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "requestsStat": {
+        "kind": "Panel",
+        "spec": {
+          "display": {
+            "name": "Requests"
+          },
+          "plugin": {
+            "kind": "StatChart",
+            "spec": {
+              "calculation": "last"
+            }
+          },
+          "queries": [
+            {
+              "kind": "TimeSeriesQuery",
+              "spec": {
+                "plugin": {
+                  "kind": "PrometheusTimeSeriesQuery",
+                  "spec": {
+                    "hidden": false,
+                    "id": "06d88e8e-0ea3-4264-ba7e-16b86783d7e2",
+                    "query": "sum(increase({otel_metric_name=\"dash0.spans\", service_name=\"glitchy-shop\", otel_span_kind=\"SERVER\"}[$__range]))",
+                    "seriesNameFormat": "Requests"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

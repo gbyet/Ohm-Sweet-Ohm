@@ -139,6 +139,77 @@ def log_expression(monitor, notes):
     return promql.replace("$__range", window), comparator, {"dash0.logs"}
 
 
+SELECTOR = re.compile(r"\{[^{}]*\}")
+SERVICE = re.compile(r'(?<![\w.])service_name="([^"]*)"')
+AGGREGATION = re.compile(r"\b(sum|avg|min|max|count)(?: by \(([^)]*)\))? \(")
+
+
+KEEP_BLOCKS = {"is_alert", "is_warning"}  # shown while the check fails
+KEEP_INVERTED = {"is_recovery", "is_alert_recovery", "is_warning_recovery", "is_no_data"}
+BLOCK = re.compile(r"\{\{([#^])(\w+)[^}]*\}\}(.*?)\{\{/\2\}\}", re.S)
+VARIABLE = re.compile(r"\{\{\{?\s*([^{}]*?)\s*\}?\}\}")
+TAG_VARIABLE = re.compile(r"^\[?([\w.-]+?)\]?(?:\.name)?$")
+# Datadog's own variables (not tags): no Dash0 equivalent
+DATADOG_VARIABLES = ("log.", "span.", "trace.", "event.", "org.", "eval", "first_triggered", "last_triggered",
+                     "triggered_", "alert_", "ok_threshold", "warn_ok_threshold", "comparator", "link",
+                     "check_message", "is_")
+MENTION = re.compile(r"(?<![\w.])@[\w.+-]+(?:@[\w.-]+)?")
+
+
+def message_template(text, notes):
+    """Datadog message (Mustache-like) -> Dash0 description (Go template)."""
+    def block(m):
+        kind, name, body = m.groups()
+        if (kind == "#" and name in KEEP_BLOCKS) or (kind == "^" and name in KEEP_INVERTED):
+            return body
+        notes.append(f"message part '{{{{{kind}{name}}}}}' dropped (Dash0 has one description)")
+        return ""
+
+    previous = None
+    while previous != text:  # nested blocks: innermost first
+        previous, text = text, BLOCK.sub(block, text)
+
+    def variable(m):
+        v = m.group(1)
+        if v == "value":
+            return "{{ $value }}"
+        if v in ("threshold", "warn_threshold"):
+            return "{{ $__threshold }}"
+        t = TAG_VARIABLE.match(v)
+        if t and not v.startswith(DATADOG_VARIABLES):
+            return "{{ $labels.%s }}" % dd.tag_label(t.group(1), [])
+        notes.append(f"message variable '{{{{{v}}}}}' has no Dash0 equivalent, removed")
+        return ""
+
+    text = VARIABLE.sub(variable, text)
+
+    def mention(m):
+        notes.append(f"notification '{m.group(0)}' not migrated: link a Dash0 notification channel")
+        return ""
+
+    text = MENTION.sub(mention, text)
+    return re.sub(r"[ \t]+\n", "\n", text).strip()
+
+
+def keep_service(expr):
+    """Group by service_name when every selector pins the same single service.
+
+    The result is still one series, as in Datadog, but it keeps the service_name label,
+    so Dash0 links the failed check to the service (service map, like Dash0's own rules)."""
+    selectors = [s for s in SELECTOR.findall(expr) if "=" in s]
+    services = {tuple(SERVICE.findall(s)) for s in selectors}
+    if not selectors or len(services) != 1 or len(next(iter(services))) != 1:
+        return expr
+
+    def group(m):
+        by = [b.strip() for b in (m.group(2) or "").split(",") if b.strip()]
+        if "service_name" not in by:
+            by.append("service_name")
+        return f"{m.group(1)} by ({', '.join(by)}) ("
+
+    return AGGREGATION.sub(group, expr)
+
+
 def convert_monitor(monitor, report):
     name = monitor["name"]
     notes = []
@@ -154,7 +225,8 @@ def convert_monitor(monitor, report):
         return None
 
     thresholds = monitor.get("options", {}).get("thresholds", {})
-    annotations = {"summary": name, "description": monitor.get("message", "")}
+    annotations = {"summary": message_template(name, notes),
+                   "description": message_template(monitor.get("message", ""), notes)}
     if "critical" in thresholds:
         annotations["dash0-threshold-critical"] = number(thresholds["critical"])
     if "warning" in thresholds:
@@ -170,7 +242,7 @@ def convert_monitor(monitor, report):
     report.add("WARN" if notes else "OK", name, notes, metrics)
     return {
         "alert": name,
-        "expr": f"{expr} {comparator} $__threshold",
+        "expr": f"{keep_service(expr)} {comparator} $__threshold",
         "for": "0s",
         "labels": labels,
         "annotations": annotations,

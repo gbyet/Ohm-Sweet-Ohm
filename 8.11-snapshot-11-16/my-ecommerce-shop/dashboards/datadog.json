@@ -1,0 +1,51 @@
+{
+  "title": "Glitchy Shop – Minimal",
+  "description": "Requests and requests per second for the faulty e-commerce demo",
+  "layout_type": "ordered",
+  "widgets": [
+    {
+      "definition": {
+        "title": "Requests",
+        "type": "query_value",
+        "requests": [
+          {
+            "response_format": "scalar",
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query1",
+                "query": "sum:trace.web.request.hits{service:glitchy-shop}.as_count()",
+                "aggregator": "sum"
+              }
+            ],
+            "formulas": [{ "formula": "query1" }]
+          }
+        ],
+        "autoscale": true,
+        "precision": 0
+      },
+      "layout": { "x": 0, "y": 0, "width": 4, "height": 2 }
+    },
+    {
+      "definition": {
+        "title": "Requests per second",
+        "type": "timeseries",
+        "requests": [
+          {
+            "response_format": "timeseries",
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query1",
+                "query": "sum:trace.web.request.hits{service:glitchy-shop}.as_rate()"
+              }
+            ],
+            "formulas": [{ "formula": "query1" }],
+            "display_type": "line"
+          }
+        ]
+      },
+      "layout": { "x": 4, "y": 0, "width": 8, "height": 2 }
+    }
+  ]
+}

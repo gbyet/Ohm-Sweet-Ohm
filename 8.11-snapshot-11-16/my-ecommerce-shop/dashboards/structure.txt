@@ -1,0 +1,7 @@
+Datadog                          Dash0 (Perses)
+widgets                          panels
+├── box 1: Requests              ├── requestsStat  → StatChart + query
+└── box 2: Requests per second   └── requestRate   → TimeSeriesChart + query
+                                 layouts
+                                 ├── position → requestsStat
+                                 └── position → requestRate

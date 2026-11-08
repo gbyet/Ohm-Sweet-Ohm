@@ -50,8 +50,10 @@ WIDGET_TYPES = {
     "list_stream": "TimeSeriesChart",  # V6: log list -> log count chart (alternative)
     "image": "Markdown",  # V7: image -> Markdown ![](url)
     "heatmap": "TimeSeriesChart",  # V10: one line per series instead of colour bands
+    "log_stream": "TimeSeriesChart",  # older log list widget -> log count chart, like list_stream
+    "geomap": "TimeSeriesTable",  # map -> table, one row per region (single-level breakdown only)
 }
-SCALAR_WIDGETS = {"query_value", "query_table", "toplist", "sunburst"}
+SCALAR_WIDGETS = {"query_value", "query_table", "toplist", "sunburst", "geomap"}
 
 # Datadog tag key -> PromQL label
 TAGS = {
@@ -794,7 +796,7 @@ def convert_widget(defn, variables, report):
         defn = dict(defn, type="query_table", title=defn.get("title") or "Host map",
                     requests=[upgrade_request({"q": fill["q"], "aggregator": "avg"})])
     wtype = defn.get("type")
-    title = defn.get("title") or {"note": "Note", "free_text": "Text", "image": "Image"}.get(wtype, wtype)
+    title = defn.get("title") or {"note": "Note", "free_text": "Text", "image": "Image", "log_stream": "Logs", "geomap": "Map"}.get(wtype, wtype)
     kind = WIDGET_TYPES.get(wtype)
 
     if kind is None:
@@ -814,7 +816,7 @@ def convert_widget(defn, variables, report):
         return panel(title, "Markdown", {"text": text}, [])
 
     notes, queries, metrics, units = [], [], set(), []
-    if wtype == "list_stream":
+    if wtype in ("list_stream", "log_stream"):
         try:
             queries = convert_log_stream(defn, notes, variables)
         except Unsupported as e:
@@ -849,7 +851,7 @@ def convert_widget(defn, variables, report):
                     promql = f"{k}({limit['count']}, {promql})"
                 elif limit:
                     notes.append("row limit dropped (table has several columns)")
-                if wtype in ("query_table", "toplist"):
+                if wtype in ("query_table", "toplist", "geomap"):
                     # rows are named after the group (e.g. the route), not the column
                     name = group_label(promql) or f.get("alias") or title
                 else:
@@ -876,6 +878,13 @@ def convert_widget(defn, variables, report):
         spec["visual"] = {"display": "bar" if display == {"bars"} else "line"}
     if wtype == "toplist":
         notes.append("toplist shown as a table (Dash0 has no ranked bar list)")
+    if wtype == "geomap":
+        levels = [group_level_count(q["spec"]["plugin"]["spec"]["query"]) for q in queries]
+        if not levels or any(n != 1 for n in levels):
+            why = "geomap is not a single-level breakdown (one group-by per query): a table would not show the same thing"
+            report.add("FAIL", title, [why])
+            return placeholder(title, f"Not migrated: {why}")
+        notes.append("geomap shown as a table, one row per region (Dash0 has no map panel)")
     if hostmap:
         notes.append("host map shown as a table, one row per host (Dash0 has no host map); size query dropped")
     if wtype == "heatmap":
@@ -1015,11 +1024,24 @@ def log_count_query(q, scalar, variables, notes, shift=None):
     return f"sum{by_clause} (increase({selector}[{window}]{offset}))", bool(group)
 
 
+def group_level_count(promql):
+    """Number of labels in the outermost 'by (...)' of a PromQL query (0 when ungrouped)."""
+    m = re.search(r"by \(([^)]*)\)", promql)
+    return len([x for x in m.group(1).split(",") if x.strip()]) if m else 0
+
+
 def convert_log_stream(defn, notes, variables=None):
     """Datadog log list -> count of matching logs over time (Dash0 synthetic metric dash0.logs).
 
     Dash0 dashboards have no log list panel; the matching log lines are in Dash0's Logs explorer.
+    list_stream holds the search in requests[0].query.query_string, the older log_stream in "query".
     """
+    if defn.get("type") == "log_stream":
+        search = (defn.get("query") or "").strip()
+        matchers = ['otel_metric_name="dash0.logs"'] + log_matchers(search, notes, variables)
+        notes.append("log list shown as a log count chart (Dash0 dashboards have no log list; see Dash0 Logs)")
+        selector = "{" + ", ".join(matchers) + "}"
+        return [prom_query(f"sum(increase({selector}[$__interval]))", "matching logs")]
     reqs = defn.get("requests", [])
     source = (reqs[0].get("query", {}).get("data_source") if len(reqs) == 1 else None)
     if source and source != "logs_stream":

@@ -44,7 +44,7 @@ A migration has two parts: **dashboards**, the numbers such as requests per seco
 ## Files
 
 ```
-deck-final-v17.pdf           pitch slides
+pitch-final-v1.pdf           pitch slides
 converter/
 ├── datadog_to_perses.py     Datadog dashboard → Dash0 dashboard (Perses)
 ├── monitors_to_dash0.py     Datadog monitor → Dash0 alert (Prometheus rule)
